@@ -1,0 +1,33 @@
+name: bangla_transcribe
+description: Minimal on-device Bangla speech transcription (Whisper GGML).
+publish_to: 'none'
+
+version: 1.0.0+1
+
+environment:
+  sdk: '>=3.7.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  cupertino_icons: ^1.0.8
+  get: ^4.7.3
+  path_provider: ^2.1.5
+  record: ^6.2.0
+  whisper_ggml:
+    git:
+      url: https://github.com/afridee/whisper_ggml.git
+      ref: b5a4b0ea67a5e6df9009a39d71e8f3b174a6ff3b  
+  permission_handler: ^12.0.1
+  audioplayers: ^6.1.0
+  crypto: ^3.0.7
+  ffi: ^2.1.3
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^5.0.0
+
+flutter:
+  uses-material-design: true

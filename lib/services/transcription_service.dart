@@ -1,0 +1,990 @@
+import 'dart:async';
+import 'dart:convert';
+import 'dart:developer' show log;
+import 'dart:ffi';
+import 'dart:io';
+import 'dart:isolate';
+import 'dart:math' as math;
+import 'dart:typed_data';
+
+import 'package:crypto/crypto.dart';
+import 'package:ffi/ffi.dart';
+import 'package:flutter/services.dart';
+import 'package:get/get.dart';
+import 'package:path_provider/path_provider.dart';
+// ignore: implementation_imports
+import 'package:whisper_ggml/src/models/requests/transcribe_request_dto.dart';
+import 'package:whisper_ggml/whisper_ggml.dart';
+
+import 'transcription_resource_monitor.dart';
+
+class WhisperVariant {
+  const WhisperVariant({
+    required this.id,
+    required this.label,
+    required this.url,
+    required this.filename,
+    required this.approxSizeMB,
+    this.expectedSha256,
+    this.lockedLanguage,
+  });
+
+  final String id;
+  final String label;
+  final String url;
+  final String filename;
+  final int approxSizeMB;
+  final String? expectedSha256;
+  final String? lockedLanguage;
+}
+
+/// Fine-tuned Bangla Whisper-small Q8_0 GGML — near-lossless vs f16, ~43% smaller, often lower RSS on device.
+const WhisperVariant kBanglaWhisper = WhisperVariant(
+  id: 'whisper-small-bangla-q8_0',
+  label: 'Bangla (whisper-small-bangla, q8_0)',
+  url:
+      'https://huggingface.co/afridee/banglaasr-ggml/resolve/main/ggml-whisper-small-bangla-q8_0.bin',
+  filename: 'ggml-whisper-small-bangla-q8_0.bin',
+  approxSizeMB: 264,
+  expectedSha256:
+      'f248fc0a32d64e7da768ee88f0e5d2aa34f3152c95cc46922856bed03ac8b22b',
+  lockedLanguage: 'bn',
+);
+
+class TranscriptionInputTooLongException implements Exception {
+  TranscriptionInputTooLongException(this.maxDurationSeconds);
+
+  final int maxDurationSeconds;
+
+  @override
+  String toString() {
+    final m = (maxDurationSeconds / 60).round();
+    return 'Recording is too long for on-device transcription '
+        '(about $m minutes max). Try a shorter take.';
+  }
+}
+
+typedef _WhisperGgmlRequestNative = Pointer<Utf8> Function(Pointer<Utf8> body);
+
+class TranscriptionService extends GetxService {
+  final isInstalled = false.obs;
+  final isReady = false.obs;
+  final downloadPct = 0.obs;
+  final lastError = RxnString();
+
+  static const int _minSaneSize = 50 * 1024 * 1024;
+  static const int _maxTranscribeDurationSeconds = 45 * 60;
+
+  /// Long clips are split into overlapping windows (short passes decode more reliably for this model).
+  static const int _pcmSampleRate = 16000;
+  static const int _chunkWindowSamples =
+      8 * _pcmSampleRate; // 8 s per Whisper call
+  static const int _chunkHopSamples =
+      6 * _pcmSampleRate; // 2 s overlap between consecutive windows
+
+  static const MethodChannel _thermalHeadroomChannel = MethodChannel(
+    'bangla_transcribe/thermal_headroom',
+  );
+
+  static int _whisperThreadCountBase(int nProcs) {
+    if (nProcs <= 2) return 1;
+    if (nProcs <= 4) return 2;
+    return 3;
+  }
+
+  static Future<bool> _thermalAllowsExtraThreads() async {
+    if (!(Platform.isAndroid || Platform.isIOS)) return false;
+    try {
+      final v = await _thermalHeadroomChannel.invokeMethod<Object?>(
+        'thermalHeadroomForWhisper',
+      );
+      return v == true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  static Future<int> _resolveWhisperThreadCount() async {
+    final n = Platform.numberOfProcessors;
+    final base = _whisperThreadCountBase(n);
+    if (!await _thermalAllowsExtraThreads()) return base;
+    final maxSuggested = math.min(n, 6);
+    return base < maxSuggested ? base + 1 : base;
+  }
+
+  @override
+  void onInit() {
+    super.onInit();
+    unawaited(_refreshInstalled());
+  }
+
+  Future<void> _refreshInstalled() async {
+    final path = await _pathFor(kBanglaWhisper);
+    isInstalled.value = await _isUsable(File(path));
+    downloadPct.value = isInstalled.value ? 100 : 0;
+  }
+
+  Future<TranscriptionService> ensureInstalled({
+    void Function(double)? onProgress,
+  }) async {
+    final variant = kBanglaWhisper;
+    try {
+      lastError.value = null;
+      final targetPath = await _pathFor(variant);
+      final target = File(targetPath);
+
+      if (await _isUsable(target)) {
+        if (variant.expectedSha256 != null) {
+          final ok = await _verifySha256(target, variant.expectedSha256!);
+          if (!ok) {
+            await target.delete();
+          } else {
+            downloadPct.value = 100;
+            isInstalled.value = true;
+            return this;
+          }
+        } else {
+          downloadPct.value = 100;
+          isInstalled.value = true;
+          return this;
+        }
+      }
+
+      await _downloadStreaming(Uri.parse(variant.url), target, onProgress);
+
+      if (variant.expectedSha256 != null) {
+        final ok = await _verifySha256(target, variant.expectedSha256!);
+        if (!ok) {
+          await target.delete().catchError((_) => target);
+          throw const FormatException(
+            'Whisper model failed sha256 verification. '
+            'The download may be corrupt; please try again.',
+          );
+        }
+      }
+
+      isInstalled.value = true;
+      return this;
+    } catch (e, st) {
+      lastError.value = e.toString();
+      log(
+        'TranscriptionService.ensureInstalled failed (${variant.id})',
+        name: 'TranscriptionService',
+        error: e,
+        stackTrace: st,
+      );
+      rethrow;
+    }
+  }
+
+  Future<TranscriptionService> warmup() async {
+    final variant = kBanglaWhisper;
+    final path = await _pathFor(variant);
+    if (!await _isUsable(File(path))) {
+      throw StateError(
+        'TranscriptionService.warmup() called before ensureInstalled() '
+        'for ${variant.id}.',
+      );
+    }
+    isReady.value = true;
+    return this;
+  }
+
+  Future<String> transcribeFile(
+    String path, {
+    String? initialPrompt,
+  }) async {
+    final variant = kBanglaWhisper;
+    final modelPath = await _pathFor(variant);
+    final lang = variant.lockedLanguage ?? 'bn';
+
+    final file = File(path);
+    if (!await file.exists()) {
+      throw StateError('Audio file not found: $path');
+    }
+
+    final totalSeconds = await _wavPlaybackSeconds(file);
+    if (totalSeconds > _maxTranscribeDurationSeconds) {
+      throw TranscriptionInputTooLongException(_maxTranscribeDurationSeconds);
+    }
+
+    final threads = await _resolveWhisperThreadCount();
+    final monitor = Get.find<TranscriptionResourceMonitorService>();
+    await _logWavLevelDiagnostics(file, nominalSeconds: totalSeconds);
+
+    final response = await monitor.collectDuring(
+      audioDurationSeconds: totalSeconds.toDouble(),
+      whisperThreads: threads,
+      work: () => _transcribePipeline(
+        path,
+        lang: lang,
+        modelPath: modelPath,
+        initialPrompt: initialPrompt,
+        threads: threads,
+      ),
+    );
+    final cleaned = _clampAndSanitizeResponse(
+      response,
+      totalDurationMs: totalSeconds * 1000,
+    );
+    _logWhisperSegments(cleaned, modelId: variant.id);
+    final text = cleaned.text.trim();
+    _logTranscript(
+      text,
+      audioSeconds: totalSeconds,
+      modelId: variant.id,
+    );
+    return text;
+  }
+
+  /// Helps tell “empty / gated start” (mic path) from “model collapsed” (Whisper path).
+  Future<void> _logWavLevelDiagnostics(
+    File f, {
+    required int nominalSeconds,
+  }) async {
+    final pcm = await _readWavPcm16Mono(f);
+    if (pcm == null || pcm.isEmpty) {
+      log(
+        'wav_levels nominal_sec=$nominalSeconds samples=0 (could not read data)',
+        name: 'TranscriptionService',
+      );
+      return;
+    }
+    final n = pcm.length;
+    final third = math.max(1, n ~/ 3);
+    double rmsWindow(int start, int len) {
+      final end = math.min(start + len, n);
+      if (end <= start) return 0;
+      var sum = 0.0;
+      for (var i = start; i < end; i++) {
+        final x = pcm[i] / 32768.0;
+        sum += x * x;
+      }
+      return math.sqrt(sum / (end - start));
+    }
+
+    int maxAbsWindow(int start, int len) {
+      final end = math.min(start + len, n);
+      var m = 0;
+      for (var i = start; i < end; i++) {
+        final a = pcm[i].abs();
+        if (a > m) m = a;
+      }
+      return m;
+    }
+
+    final rms0 = rmsWindow(0, third);
+    final rms1 = rmsWindow(third, third);
+    final rms2 = rmsWindow(2 * third, n - 2 * third);
+    final mx0 = maxAbsWindow(0, third);
+    final mx1 = maxAbsWindow(third, third);
+    final mx2 = maxAbsWindow(2 * third, n - 2 * third);
+
+    log(
+      'wav_levels nominal_sec=$nominalSeconds samples=$n '
+      'rms_thirds=${rms0.toStringAsFixed(4)},${rms1.toStringAsFixed(4)},${rms2.toStringAsFixed(4)} '
+      'maxAbs_thirds=$mx0,$mx1,$mx2',
+      name: 'TranscriptionService',
+    );
+  }
+
+  void _logWhisperSegments(WhisperTranscribeResponse response, {required String modelId}) {
+    final segs = response.segments;
+    if (segs == null || segs.isEmpty) {
+      log(
+        'whisper_segments model=$modelId count=0 (no timestamp payload)',
+        name: 'TranscriptionService',
+      );
+      return;
+    }
+    final buf = StringBuffer('whisper_segments model=$modelId count=${segs.length}\n');
+    for (var i = 0; i < segs.length; i++) {
+      final s = segs[i];
+      final t0 = s.fromTs.inMilliseconds;
+      final t1 = s.toTs.inMilliseconds;
+      final snippet = s.text.replaceAll('\n', ' ').trim();
+      final clip = snippet.length > 120 ? '${snippet.substring(0, 120)}…' : snippet;
+      buf.writeln('#$i ${t0}ms→${t1}ms len=${snippet.runes.length}: $clip');
+    }
+    log(buf.toString().trimRight(), name: 'TranscriptionService');
+  }
+
+  /// Multi-line log so the Bangla text isn't truncated by IDE log viewers.
+  void _logTranscript(
+    String text, {
+    required int audioSeconds,
+    required String modelId,
+  }) {
+    final codePointCount = text.runes.length;
+    final words = _wordCount(text);
+    log(
+      'last_transcript model=$modelId audio_sec=$audioSeconds chars=$codePointCount words=$words\n'
+      '----- BEGIN TRANSCRIPT -----\n'
+      '$text\n'
+      '----- END TRANSCRIPT -----',
+      name: 'TranscriptionService',
+    );
+  }
+
+  static int _wordCount(String text) {
+    var n = 0;
+    var inWord = false;
+    for (final r in text.runes) {
+      final isSpace = r == 0x20 ||
+          r == 0x09 ||
+          r == 0x0A ||
+          r == 0x0D ||
+          r == 0x00A0;
+      if (isSpace) {
+        inWord = false;
+      } else if (!inWord) {
+        inWord = true;
+        n++;
+      }
+    }
+    return n;
+  }
+
+  Future<WhisperTranscribeResponse> _transcribePipeline(
+    String audioPath, {
+    required String lang,
+    required String modelPath,
+    required int threads,
+    String? initialPrompt,
+  }) async {
+    final f = File(audioPath);
+    final nativeReady = await _wavIsWhisperNativeReady(f);
+    if (!nativeReady) {
+      return _transcribeOneFile(
+        audioPath,
+        lang: lang,
+        modelPath: modelPath,
+        threads: threads,
+        initialPrompt: initialPrompt,
+      );
+    }
+
+    final pcm = await _readWavPcm16Mono(f);
+    if (pcm == null || pcm.length <= _chunkWindowSamples) {
+      return _transcribeOneFile(
+        audioPath,
+        lang: lang,
+        modelPath: modelPath,
+        threads: threads,
+        initialPrompt: initialPrompt,
+      );
+    }
+
+    return _transcribeChunkedPcm(
+      pcm,
+      lang: lang,
+      modelPath: modelPath,
+      threads: threads,
+      initialPrompt: initialPrompt,
+    );
+  }
+
+  /// Splits mono PCM into overlapping ~8 s WAV slices; merges text with rune-safe overlap trim.
+  Future<WhisperTranscribeResponse> _transcribeChunkedPcm(
+    Int16List fullPcm, {
+    required String lang,
+    required String modelPath,
+    required int threads,
+    String? initialPrompt,
+  }) async {
+    final windows = <({int start, Int16List slice})>[];
+    var start = 0;
+    while (start < fullPcm.length) {
+      final end = math.min(start + _chunkWindowSamples, fullPcm.length);
+      if (end > start) {
+        windows.add((start: start, slice: fullPcm.sublist(start, end)));
+      }
+      if (end >= fullPcm.length) break;
+      start += _chunkHopSamples;
+    }
+
+    log(
+      'chunked_transcribe total_samples=${fullPcm.length} (~${fullPcm.length / _pcmSampleRate}s) '
+      'windows=${windows.length} len_s=${_chunkWindowSamples / _pcmSampleRate} '
+      'hop_s=${_chunkHopSamples / _pcmSampleRate} overlap_s=${(_chunkWindowSamples - _chunkHopSamples) / _pcmSampleRate}',
+      name: 'TranscriptionService',
+    );
+
+    final dir = await getTemporaryDirectory();
+    final session = DateTime.now().microsecondsSinceEpoch;
+    final mergedSegs = <WhisperTranscribeSegment>[];
+
+    var mergedText = '';
+    for (var chunkIx = 0; chunkIx < windows.length; chunkIx++) {
+      final w = windows[chunkIx];
+      final wavPath = '${dir.path}/bangla_chunk_${session}_$chunkIx.wav';
+      final tmp = File(wavPath);
+      await tmp.writeAsBytes(_wavFromPcm16Mono(w.slice));
+      try {
+        final resp = await _transcribeOneFile(
+          wavPath,
+          lang: lang,
+          modelPath: modelPath,
+          threads: threads,
+          initialPrompt: chunkIx == 0 ? initialPrompt : null,
+        );
+        final t = resp.text.trim();
+        final segCount = resp.segments?.length ?? 0;
+        final pcmEnd = w.start + w.slice.length;
+        final durMs = (w.slice.length * 1000 / _pcmSampleRate).round();
+        log(
+          'chunk_result ix=$chunkIx '
+          'pcm=${w.start}..$pcmEnd (~${(durMs / 1000).toStringAsFixed(2)}s) '
+          'empty=${t.isEmpty} runes=${t.runes.length} words=${_wordCount(t)} '
+          'segments=$segCount '
+          'snippet=${_oneLineLogSnippet(t)}',
+          name: 'TranscriptionService',
+        );
+
+        mergedText = mergedText.isEmpty
+            ? t
+            : _mergeOverlappingChunkText(mergedText, t);
+
+        final offMs = w.start * 1000 ~/ _pcmSampleRate;
+        final segs = resp.segments;
+        if (segs != null) {
+          for (final s in segs) {
+            mergedSegs.add(
+              WhisperTranscribeSegment(
+                fromTs: Duration(
+                  milliseconds: s.fromTs.inMilliseconds + offMs,
+                ),
+                toTs: Duration(
+                  milliseconds: s.toTs.inMilliseconds + offMs,
+                ),
+                text: s.text,
+              ),
+            );
+          }
+        }
+      } finally {
+        await _deleteIfExists(tmp);
+      }
+    }
+
+    return WhisperTranscribeResponse(
+      type: 'transcribe',
+      text: mergedText,
+      segments: mergedSegs.isEmpty ? null : mergedSegs,
+    );
+  }
+
+  /// Minimal PCM WAV (16 kHz mono s16le) for temp chunk files.
+  Uint8List _wavFromPcm16Mono(Int16List pcm, {int sampleRate = _pcmSampleRate}) {
+    final n = pcm.length;
+    final dataSize = n * 2;
+    final out = Uint8List(44 + dataSize);
+    final bd = ByteData.sublistView(out);
+
+    out.setAll(0, [0x52, 0x49, 0x46, 0x46]);
+    bd.setUint32(4, 36 + dataSize, Endian.little);
+    out.setAll(8, [0x57, 0x41, 0x56, 0x45]);
+    out.setAll(12, [0x66, 0x6d, 0x74, 0x20]);
+    bd.setUint32(16, 16, Endian.little);
+    bd.setUint16(20, 1, Endian.little);
+    bd.setUint16(22, 1, Endian.little);
+    bd.setUint32(24, sampleRate, Endian.little);
+    bd.setUint32(28, sampleRate * 2, Endian.little);
+    bd.setUint16(32, 2, Endian.little);
+    bd.setUint16(34, 16, Endian.little);
+    out.setAll(36, [0x64, 0x61, 0x74, 0x61]);
+    bd.setUint32(40, dataSize, Endian.little);
+
+    for (var i = 0; i < n; i++) {
+      bd.setInt16(44 + i * 2, pcm[i], Endian.little);
+    }
+    return out;
+  }
+
+  /// Drops duplicate prefix of [nextChunk] when it repeats a suffix of [accumulated] (overlap stitch).
+  String _mergeOverlappingChunkText(String accumulated, String nextChunk) {
+    final a = accumulated.trimRight();
+    final b = nextChunk.trimLeft();
+    if (b.isEmpty) return a;
+    if (a.isEmpty) return b;
+
+    final ar = a.runes.toList();
+    final br = b.runes.toList();
+    final maxK = math.min(ar.length, br.length);
+    const minOverlapRunes = 3;
+    for (var k = maxK; k >= minOverlapRunes; k--) {
+      var match = true;
+      for (var i = 0; i < k; i++) {
+        if (ar[ar.length - k + i] != br[i]) {
+          match = false;
+          break;
+        }
+      }
+      if (match) {
+        final tail = br.sublist(k);
+        return a + String.fromCharCodes(tail);
+      }
+    }
+    return '$a $b';
+  }
+
+  /// Single-line preview for chunk debug logs (rune-safe cap).
+  String _oneLineLogSnippet(String s, {int maxRunes = 96}) {
+    final folded = s
+        .replaceAll('\n', ' ')
+        .replaceAll('\r', ' ')
+        .replaceAll('\t', ' ')
+        .trim();
+    final collapsed = folded.split(' ').where((w) => w.isNotEmpty).join(' ');
+    final r = collapsed.runes.toList();
+    if (r.length <= maxRunes) return collapsed;
+    return '${String.fromCharCodes(r.sublist(0, maxRunes))}…';
+  }
+
+  /// U+FFFD often appears at bounds from JSON / truncated UTF-8; trim for display and logs.
+  String _stripReplacementCharArtifacts(String s) {
+    final r = s.runes.toList();
+    var a = 0;
+    while (a < r.length && r[a] == 0xFFFD) {
+      a++;
+    }
+    var b = r.length;
+    while (b > a && r[b - 1] == 0xFFFD) {
+      b--;
+    }
+    if (a == 0 && b == r.length) return s;
+    return String.fromCharCodes(r.sublist(a, b));
+  }
+
+  /// Whisper timestamp units can overshoot short tails; keep segments within real clip length.
+  WhisperTranscribeResponse _clampAndSanitizeResponse(
+    WhisperTranscribeResponse r, {
+    required int totalDurationMs,
+  }) {
+    final text = _stripReplacementCharArtifacts(r.text.trim());
+    final segs = r.segments;
+    if (segs == null || segs.isEmpty) {
+      return WhisperTranscribeResponse(type: r.type, text: text, segments: null);
+    }
+    final out = <WhisperTranscribeSegment>[];
+    for (final s in segs) {
+      var from = s.fromTs.inMilliseconds.clamp(0, totalDurationMs);
+      var to = s.toTs.inMilliseconds.clamp(0, totalDurationMs);
+      if (to < from) to = from;
+      out.add(
+        WhisperTranscribeSegment(
+          fromTs: Duration(milliseconds: from),
+          toTs: Duration(milliseconds: to),
+          text: _stripReplacementCharArtifacts(s.text),
+        ),
+      );
+    }
+    return WhisperTranscribeResponse(type: r.type, text: text, segments: out);
+  }
+
+  Future<WhisperTranscribeResponse> _transcribeOneFile(
+    String audioPath, {
+    required String lang,
+    required String modelPath,
+    required int threads,
+    String? initialPrompt,
+  }) async {
+    final f = File(audioPath);
+    final skipFfmpeg = await _wavIsWhisperNativeReady(f);
+    try {
+      if (skipFfmpeg) {
+        final dto = TranscribeRequestDto.fromTranscribeRequest(
+          TranscribeRequest(
+            audio: audioPath,
+            language: lang,
+            isTranslate: false,
+            // Per-segment times in JSON for logging; concatenated text unchanged.
+            isNoTimestamps: false,
+            splitOnWord: false,
+            isRealtime: false,
+            speedUp: false,
+            threads: threads,
+          ),
+          modelPath,
+        );
+        final result = await _whisperNativeRequest(
+          dto,
+          initialPrompt: initialPrompt,
+        );
+        if (result['text'] == null) {
+          throw Exception(result['message'] ?? 'Whisper failed');
+        }
+        return WhisperTranscribeResponse.fromJson(result);
+      }
+
+      final whisper = Whisper(model: WhisperModel.small);
+      final response = await whisper.transcribe(
+        transcribeRequest: TranscribeRequest(
+          audio: audioPath,
+          language: lang,
+          isTranslate: false,
+          isNoTimestamps: false,
+          splitOnWord: false,
+          isRealtime: false,
+          speedUp: false,
+          threads: threads,
+        ),
+        modelPath: modelPath,
+      );
+      return response;
+    } finally {
+      if (!skipFfmpeg) {
+        await _deleteWhisperConvertSidecar(audioPath);
+      }
+    }
+  }
+
+  Future<Map<String, dynamic>> _whisperNativeRequest(
+    TranscribeRequestDto dto, {
+    String? initialPrompt,
+  }) {
+    final Map<String, dynamic> map =
+        json.decode(dto.toRequestString()) as Map<String, dynamic>;
+    if (initialPrompt != null && initialPrompt.trim().isNotEmpty) {
+      map['prompt'] = initialPrompt.trim();
+    }
+    final payload = json.encode(map);
+    return Isolate.run(() async {
+      final data = payload.toNativeUtf8();
+      final lib = Platform.isAndroid
+          ? DynamicLibrary.open('libwhisper.so')
+          : DynamicLibrary.process();
+      final native = lib.lookupFunction<
+          _WhisperGgmlRequestNative,
+          _WhisperGgmlRequestNative>('request');
+      final resPtr = native.call(data);
+      final result =
+          json.decode(resPtr.toDartString()) as Map<String, dynamic>;
+      malloc.free(data);
+      return result;
+    });
+  }
+
+  Future<void> _deleteIfExists(File f) async {
+    try {
+      if (await f.exists()) await f.delete();
+    } catch (_) {}
+  }
+
+  Future<void> _deleteWhisperConvertSidecar(String audioPath) async {
+    await _deleteIfExists(File('$audioPath.wav'));
+  }
+
+  Future<bool> _wavIsWhisperNativeReady(File f) async {
+    final fmt = await _readWavPcmFmt(f);
+    if (fmt == null) return false;
+    return fmt.sampleRate == 16000 &&
+        fmt.numChannels == 1 &&
+        fmt.bitsPerSample == 16 &&
+        fmt.audioFormat == 1;
+  }
+
+  Future<_WavPcmFmt?> _readWavPcmFmt(File f) async {
+    RandomAccessFile? raf;
+    try {
+      raf = await f.open(mode: FileMode.read);
+      final fileLen = await raf.length();
+      if (fileLen < 12) return null;
+
+      await raf.setPosition(0);
+      final head = await raf.read(12);
+      if (head.length < 12) return null;
+      if (String.fromCharCodes(head.sublist(0, 4)) != 'RIFF') return null;
+      if (String.fromCharCodes(head.sublist(8, 12)) != 'WAVE') return null;
+
+      var pos = 12;
+      while (pos + 8 <= fileLen) {
+        await raf.setPosition(pos);
+        final idBytes = await raf.read(4);
+        final sizeBytes = await raf.read(4);
+        if (idBytes.length < 4 || sizeBytes.length < 4) return null;
+        final chunkId = String.fromCharCodes(idBytes);
+        final chunkSize = ByteData.sublistView(
+          Uint8List.fromList(sizeBytes),
+        ).getUint32(0, Endian.little);
+        final payloadStart = pos + 8;
+
+        if (chunkId == 'fmt ') {
+          await raf.setPosition(payloadStart);
+          final n = math.min(chunkSize, 24);
+          final raw = await raf.read(n);
+          if (raw.length < 16) return null;
+          final bd = ByteData.sublistView(Uint8List.fromList(raw.sublist(0, 16)));
+          return _WavPcmFmt(
+            audioFormat: bd.getUint16(0, Endian.little),
+            numChannels: bd.getUint16(2, Endian.little),
+            sampleRate: bd.getUint32(4, Endian.little),
+            bitsPerSample: bd.getUint16(14, Endian.little),
+          );
+        }
+
+        pos = payloadStart + chunkSize + (chunkSize & 1);
+      }
+      return null;
+    } catch (_) {
+      return null;
+    } finally {
+      await raf?.close();
+    }
+  }
+
+  /// Raw mono PCM from first `data` chunk (16-bit LE). Stereo is downmixed for diagnostics only.
+  Future<Int16List?> _readWavPcm16Mono(File f) async {
+    RandomAccessFile? raf;
+    try {
+      raf = await f.open(mode: FileMode.read);
+      final fileLen = await raf.length();
+      if (fileLen < 44) return null;
+
+      await raf.setPosition(0);
+      final head = await raf.read(12);
+      if (head.length < 12) return null;
+      if (String.fromCharCodes(head.sublist(0, 4)) != 'RIFF') return null;
+      if (String.fromCharCodes(head.sublist(8, 12)) != 'WAVE') return null;
+
+      var pos = 12;
+      int numChannels = 1;
+      var bitsPerSample = 16;
+
+      while (pos + 8 <= fileLen) {
+        await raf.setPosition(pos);
+        final idBytes = await raf.read(4);
+        final sizeBytes = await raf.read(4);
+        if (idBytes.length < 4 || sizeBytes.length < 4) return null;
+        final chunkId = String.fromCharCodes(idBytes);
+        final chunkSize = ByteData.sublistView(
+          Uint8List.fromList(sizeBytes),
+        ).getUint32(0, Endian.little);
+        final payloadStart = pos + 8;
+
+        if (chunkId == 'fmt ') {
+          await raf.setPosition(payloadStart);
+          final n = math.min(chunkSize, 32);
+          final fmt = await raf.read(n);
+          if (fmt.length >= 16) {
+            final bd = ByteData.sublistView(
+              Uint8List.fromList(fmt.sublist(0, 16)),
+            );
+            numChannels = bd.getUint16(2, Endian.little);
+            bitsPerSample = bd.getUint16(14, Endian.little);
+          }
+        } else if (chunkId == 'data') {
+          if (bitsPerSample != 16) return null;
+          await raf.setPosition(payloadStart);
+          final raw = await raf.read(chunkSize);
+          if (raw.length < chunkSize) return null;
+          if (raw.length % 2 != 0) return null;
+          final bytes = Uint8List.fromList(raw);
+          final all = Int16List.view(
+            bytes.buffer,
+            bytes.offsetInBytes,
+            bytes.length ~/ 2,
+          );
+          if (numChannels == 1) {
+            return all;
+          }
+          if (numChannels == 2 && all.length >= 2) {
+            final out = Int16List(all.length ~/ 2);
+            for (var i = 0; i < out.length; i++) {
+              final l = all[i * 2];
+              final r = all[i * 2 + 1];
+              out[i] = ((l + r) >> 1);
+            }
+            return out;
+          }
+          return null;
+        }
+
+        pos = payloadStart + chunkSize + (chunkSize & 1);
+      }
+      return null;
+    } catch (_) {
+      return null;
+    } finally {
+      await raf?.close();
+    }
+  }
+
+  Future<int> _wavPlaybackSeconds(File f) async {
+    final fromHeader = await _parseWavDurationSeconds(f);
+    if (fromHeader != null && fromHeader > 0) return fromHeader;
+
+    final len = await f.length();
+    final approx = (len ~/ 32000).clamp(1, _maxTranscribeDurationSeconds);
+    return approx;
+  }
+
+  Future<int?> _parseWavDurationSeconds(File f) async {
+    RandomAccessFile? raf;
+    try {
+      raf = await f.open(mode: FileMode.read);
+      final fileLen = await raf.length();
+      if (fileLen < 44) return null;
+
+      await raf.setPosition(0);
+      final head = await raf.read(12);
+      if (head.length < 12) return null;
+      if (String.fromCharCodes(head.sublist(0, 4)) != 'RIFF') return null;
+      if (String.fromCharCodes(head.sublist(8, 12)) != 'WAVE') return null;
+
+      var pos = 12;
+      int? sampleRate;
+      int? numChannels;
+      int? bitsPerSample;
+
+      while (pos + 8 <= fileLen) {
+        await raf.setPosition(pos);
+        final idBytes = await raf.read(4);
+        final sizeBytes = await raf.read(4);
+        if (idBytes.length < 4 || sizeBytes.length < 4) return null;
+        final chunkId = String.fromCharCodes(idBytes);
+        final chunkSize = ByteData.sublistView(
+          Uint8List.fromList(sizeBytes),
+        ).getUint32(0, Endian.little);
+        final payloadStart = pos + 8;
+
+        if (chunkId == 'fmt ') {
+          await raf.setPosition(payloadStart);
+          final n = math.min(chunkSize, 32);
+          final fmt = await raf.read(n);
+          if (fmt.length >= 16) {
+            final bd = ByteData.sublistView(
+              Uint8List.fromList(fmt.sublist(0, 16)),
+            );
+            numChannels = bd.getUint16(2, Endian.little);
+            sampleRate = bd.getUint32(4, Endian.little);
+            bitsPerSample = bd.getUint16(14, Endian.little);
+          }
+        } else if (chunkId == 'data') {
+          sampleRate ??= 16000;
+          numChannels ??= 1;
+          bitsPerSample ??= 16;
+          final bytesPerFrame = numChannels * (bitsPerSample ~/ 8);
+          if (bytesPerFrame <= 0 || sampleRate <= 0) return null;
+          final frameCount = chunkSize ~/ bytesPerFrame;
+          return math.max(1, (frameCount + sampleRate - 1) ~/ sampleRate);
+        }
+
+        pos = payloadStart + chunkSize + (chunkSize & 1);
+      }
+      return null;
+    } catch (_) {
+      return null;
+    } finally {
+      await raf?.close();
+    }
+  }
+
+  Future<String> _modelDir() async {
+    final dir = Platform.isAndroid
+        ? await getApplicationSupportDirectory()
+        : await getLibraryDirectory();
+    return dir.path;
+  }
+
+  Future<String> _pathFor(WhisperVariant v) async {
+    return '${await _modelDir()}/${v.filename}';
+  }
+
+  Future<bool> _isUsable(File f) async {
+    if (!await f.exists()) return false;
+    final len = await f.length();
+    return len >= _minSaneSize;
+  }
+
+  Future<bool> _verifySha256(File f, String expectedHex) async {
+    final digest = await sha256.bind(f.openRead()).first;
+    final actual = digest.toString();
+    if (actual.toLowerCase() != expectedHex.toLowerCase()) {
+      log(
+        'sha256 mismatch for ${f.path}: expected $expectedHex, got $actual',
+        name: 'TranscriptionService',
+      );
+      return false;
+    }
+    return true;
+  }
+
+  Future<void> _downloadStreaming(
+    Uri uri,
+    File target,
+    void Function(double)? onProgress,
+  ) async {
+    final partFile = File('${target.path}.part');
+    await target.parent.create(recursive: true);
+    if (await partFile.exists()) {
+      await partFile.delete();
+    }
+
+    final client = HttpClient();
+    try {
+      final req = await client.getUrl(uri);
+      req.followRedirects = true;
+      req.maxRedirects = 5;
+      final resp = await req.close();
+
+      if (resp.statusCode < 200 || resp.statusCode >= 300) {
+        throw HttpException(
+          'Whisper model download failed: HTTP ${resp.statusCode}',
+          uri: uri,
+        );
+      }
+
+      final total = resp.contentLength;
+      var received = 0;
+      downloadPct.value = 0;
+
+      final sink = partFile.openWrite();
+      try {
+        await for (final chunk in resp) {
+          sink.add(chunk);
+          received += chunk.length;
+          if (total > 0) {
+            final pct = (received / total) * 100.0;
+            downloadPct.value = pct.floor().clamp(0, 100);
+            onProgress?.call(pct);
+          }
+        }
+        await sink.flush();
+      } finally {
+        await sink.close();
+      }
+
+      if (total > 0 && received < total) {
+        throw const HttpException(
+          'Whisper model download truncated before EOF.',
+        );
+      }
+      if (!await _isUsable(partFile)) {
+        throw const HttpException(
+          'Whisper model download too small to be valid.',
+        );
+      }
+
+      if (await target.exists()) await target.delete();
+      await partFile.rename(target.path);
+      downloadPct.value = 100;
+    } finally {
+      client.close(force: true);
+    }
+  }
+}
+
+class _WavPcmFmt {
+  const _WavPcmFmt({
+    required this.audioFormat,
+    required this.numChannels,
+    required this.sampleRate,
+    required this.bitsPerSample,
+  });
+
+  final int audioFormat;
+  final int numChannels;
+  final int sampleRate;
+  final int bitsPerSample;
+}
