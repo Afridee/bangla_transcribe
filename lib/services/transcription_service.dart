@@ -82,6 +82,11 @@ class TranscriptionService extends GetxService {
   static const int _chunkHopSamples =
       6 * _pcmSampleRate; // 2 s overlap between consecutive windows
 
+  static const int _pcmBytesPerSample = 2;
+  static int get _maxRecordedSamples =>
+      _maxTranscribeDurationSeconds * _pcmSampleRate;
+  static const double _pipelinedBurstLogThresholdSec = 14.0;
+
   static const MethodChannel _thermalHeadroomChannel = MethodChannel(
     'bangla_transcribe/thermal_headroom',
   );
@@ -235,6 +240,17 @@ class TranscriptionService extends GetxService {
       modelId: variant.id,
     );
     return text;
+  }
+
+  LiveTranscriptionSession beginLiveTranscription({
+    required void Function(String merged) onPartial,
+    String? initialPrompt,
+  }) {
+    return LiveTranscriptionSession._(
+      this,
+      onPartial: onPartial,
+      initialPrompt: initialPrompt,
+    );
   }
 
   /// Helps tell “empty / gated start” (mic path) from “model collapsed” (Whisper path).
@@ -972,6 +988,406 @@ class TranscriptionService extends GetxService {
     } finally {
       client.close(force: true);
     }
+  }
+}
+
+/// Pipelined chunked transcription fed from aligned `pcm16` stream (see [RecordingService.startStreaming]).
+class LiveTranscriptionSession {
+  LiveTranscriptionSession._(
+    this._svc, {
+    required void Function(String merged) onPartial,
+    String? initialPrompt,
+  })  : _onPartial = onPartial,
+        _initialPrompt = initialPrompt,
+        _sessionId = DateTime.now().microsecondsSinceEpoch;
+
+  final TranscriptionService _svc;
+  final void Function(String merged) _onPartial;
+  final String? _initialPrompt;
+  final int _sessionId;
+
+  Future<int>? _threadsFut;
+  Future<String>? _modelPathFut;
+
+  final _fifo = _ByteFifo();
+  int _fifoBaseAbsoluteSample = 0;
+  int _nextWindowAbsoluteStart = 0;
+  int _samplesIngestedTotal = 0;
+  int _chunksDone = 0;
+
+  Future<void> _drainLocks = Future<void>.value();
+
+  bool _disposed = false;
+  bool _finalized = false;
+  bool _heavyBacklogLogged = false;
+
+  String _mergedText = '';
+  final List<WhisperTranscribeSegment> _mergedSegments = [];
+
+  /// Wall-audio not yet covered by the segmentation cursor (informative only).
+  final backlogAudioSeconds = 0.0.obs;
+
+  /// Human-readable backlog hint for the HUD (empty when negligible).
+  final backlogHudLine = ''.obs;
+
+  bool get isDisposed => _disposed;
+
+  void _kickDrain() {
+    _drainLocks = _drainLocks.then((_) async {
+      if (_disposed) return;
+      await _pumpBodies();
+    });
+  }
+
+  Future<void> _pumpBodies() async {
+    if (_disposed) return;
+
+    final t = await (_threadsFut ??=
+        TranscriptionService._resolveWhisperThreadCount());
+    final m =
+        await (_modelPathFut ??= _svc._pathFor(kBanglaWhisper));
+    final lang = kBanglaWhisper.lockedLanguage ?? 'bn';
+    final w = TranscriptionService._chunkWindowSamples;
+    final hop = TranscriptionService._chunkHopSamples;
+    final dir = await getTemporaryDirectory();
+
+    while (!_disposed) {
+      while (!_disposed) {
+        final absEnd = _fifoBaseAbsoluteSample +
+            (_fifo.byteLength ~/ TranscriptionService._pcmBytesPerSample);
+        if (absEnd < _nextWindowAbsoluteStart + w) {
+          break;
+        }
+
+        await _emitOneWindow(
+          dir: dir,
+          modelPath: m,
+          threads: t,
+          lang: lang,
+          windowSamples: w,
+          hopSamples: hop,
+        );
+      }
+
+      if (!_finalized) {
+        _recomputeBacklog();
+        return;
+      }
+
+      final absEnd = _fifoBaseAbsoluteSample +
+          (_fifo.byteLength ~/ TranscriptionService._pcmBytesPerSample);
+      final tailSamples = absEnd - _nextWindowAbsoluteStart;
+      if (tailSamples > 0) {
+        await _emitTail(
+          dir: dir,
+          modelPath: m,
+          threads: t,
+          lang: lang,
+          tailSamples: tailSamples,
+        );
+      }
+
+      _recomputeBacklog();
+      return;
+    }
+
+    _recomputeBacklog();
+  }
+
+  Future<void> _emitOneWindow({
+    required Directory dir,
+    required String modelPath,
+    required int threads,
+    required String lang,
+    required int windowSamples,
+    required int hopSamples,
+  }) async {
+    final S = _nextWindowAbsoluteStart;
+    final byteOff = (S - _fifoBaseAbsoluteSample) *
+        TranscriptionService._pcmBytesPerSample;
+    final pcm = _fifo.int16Slice(byteOff, windowSamples);
+
+    final ix = _chunksDone;
+    final wavPath = '${dir.path}/bangla_live_${_sessionId}_$ix.wav';
+    final tmp = File(wavPath);
+    await tmp.writeAsBytes(_svc._wavFromPcm16Mono(pcm));
+
+    try {
+      final resp = await _svc._transcribeOneFile(
+        wavPath,
+        lang: lang,
+        modelPath: modelPath,
+        threads: threads,
+        initialPrompt: ix == 0 ? _initialPrompt : null,
+      );
+      _applyChunkResult(
+        absoluteStartSamples: S,
+        windowSamples: windowSamples,
+        resp: resp,
+        chunkIx: ix,
+      );
+    } finally {
+      await _svc._deleteIfExists(tmp);
+    }
+
+    _chunksDone++;
+
+    final newBase = S + hopSamples;
+    final dropBytes =
+        (newBase - _fifoBaseAbsoluteSample) *
+            TranscriptionService._pcmBytesPerSample;
+    _fifo.dropFirst(dropBytes);
+    _fifoBaseAbsoluteSample = newBase;
+    _nextWindowAbsoluteStart = newBase;
+
+    _onPartial(_mergedText.trim());
+  }
+
+  Future<void> _emitTail({
+    required Directory dir,
+    required String modelPath,
+    required int threads,
+    required String lang,
+    required int tailSamples,
+  }) async {
+    final S = _nextWindowAbsoluteStart;
+    final byteOff =
+        (S - _fifoBaseAbsoluteSample) * TranscriptionService._pcmBytesPerSample;
+    final pcm = _fifo.int16Slice(byteOff, tailSamples);
+
+    final ix = _chunksDone;
+    final wavPath = '${dir.path}/bangla_live_${_sessionId}_$ix.wav';
+    final tmp = File(wavPath);
+    await tmp.writeAsBytes(_svc._wavFromPcm16Mono(pcm));
+
+    try {
+      final resp = await _svc._transcribeOneFile(
+        wavPath,
+        lang: lang,
+        modelPath: modelPath,
+        threads: threads,
+        initialPrompt: ix == 0 ? _initialPrompt : null,
+      );
+      _applyChunkResult(
+        absoluteStartSamples: S,
+        windowSamples: tailSamples,
+        resp: resp,
+        chunkIx: ix,
+      );
+    } finally {
+      await _svc._deleteIfExists(tmp);
+    }
+
+    _chunksDone++;
+
+    final newEnd = S + tailSamples;
+    _fifo.clear();
+    _fifoBaseAbsoluteSample = newEnd;
+    _nextWindowAbsoluteStart = newEnd;
+
+    _onPartial(_mergedText.trim());
+  }
+
+  void _applyChunkResult({
+    required int absoluteStartSamples,
+    required int windowSamples,
+    required WhisperTranscribeResponse resp,
+    required int chunkIx,
+  }) {
+    final t = resp.text.trim();
+    final pcmEnd = absoluteStartSamples + windowSamples;
+    final durMs =
+        (windowSamples * 1000 / TranscriptionService._pcmSampleRate).round();
+    log(
+      'live_chunk ix=$chunkIx '
+      'pcm=$absoluteStartSamples..$pcmEnd (~${(durMs / 1000).toStringAsFixed(2)}s) '
+      'empty=${t.isEmpty} segments=${resp.segments?.length ?? 0} '
+      'snippet=${_svc._oneLineLogSnippet(t)}',
+      name: 'TranscriptionService',
+    );
+
+    _mergedText = _mergedText.isEmpty
+        ? t
+        : _svc._mergeOverlappingChunkText(_mergedText, t);
+
+    final offMs =
+        absoluteStartSamples * 1000 ~/ TranscriptionService._pcmSampleRate;
+    final segs = resp.segments;
+    if (segs != null) {
+      for (final s in segs) {
+        _mergedSegments.add(
+          WhisperTranscribeSegment(
+            fromTs: Duration(milliseconds: s.fromTs.inMilliseconds + offMs),
+            toTs: Duration(milliseconds: s.toTs.inMilliseconds + offMs),
+            text: s.text,
+          ),
+        );
+      }
+    }
+  }
+
+  void _recomputeBacklog() {
+    final absEnd = _fifoBaseAbsoluteSample +
+        (_fifo.byteLength ~/ TranscriptionService._pcmBytesPerSample);
+    final debtSamples = math.max(0, absEnd - _nextWindowAbsoluteStart);
+    final secs = debtSamples / TranscriptionService._pcmSampleRate;
+    backlogAudioSeconds.value = secs;
+
+    backlogHudLine.value = secs >= 2.0
+        ? 'Transcription backlog ~${secs.clamp(0, 9999).toStringAsFixed(0)} s ahead (Whisper may trail while recording)'
+        : '';
+  }
+
+  void ingestAlignedPcm16Mono(Uint8List bytes) {
+    if (_disposed || _finalized || bytes.isEmpty) return;
+    if (bytes.length.isOdd) return;
+
+    final newSamples =
+        bytes.length ~/ TranscriptionService._pcmBytesPerSample;
+    final maxSamples = TranscriptionService._maxRecordedSamples;
+
+    final nextTotal = _samplesIngestedTotal + newSamples;
+    if (nextTotal > maxSamples) {
+      throw TranscriptionInputTooLongException(
+        TranscriptionService._maxTranscribeDurationSeconds,
+      );
+    }
+
+    _fifo.add(bytes);
+    _samplesIngestedTotal = nextTotal;
+    _recomputeBacklog();
+
+    final latest = backlogAudioSeconds.value;
+    if (!_finalized &&
+        !_disposed &&
+        latest >= TranscriptionService._pipelinedBurstLogThresholdSec &&
+        !_heavyBacklogLogged) {
+      _heavyBacklogLogged = true;
+      log(
+        'live_pcm_burst backlog_audio_sec=${latest.toStringAsFixed(2)} '
+        '(hint: Whisper may lag realtime on long takes)',
+        name: 'TranscriptionService',
+      );
+    }
+
+    _kickDrain();
+  }
+
+  Future<String> finalize({String? fullWavPath}) async {
+    if (_finalized) {
+      throw StateError('LiveTranscriptionSession.finalize twice');
+    }
+    _finalized = true;
+
+    final threads = await (_threadsFut ??=
+        TranscriptionService._resolveWhisperThreadCount());
+
+    final totalDurMs =
+        _samplesIngestedTotal * 1000 ~/ TranscriptionService._pcmSampleRate;
+    final nominalSeconds =
+        _samplesIngestedTotal / TranscriptionService._pcmSampleRate;
+
+    final monitor = Get.find<TranscriptionResourceMonitorService>();
+
+    if (fullWavPath != null) {
+      final pf = File(fullWavPath);
+      if (await pf.exists()) {
+        await _svc._logWavLevelDiagnostics(
+          pf,
+          nominalSeconds: nominalSeconds.ceil(),
+        );
+      }
+    }
+
+    final mergedResponse =
+        await monitor.collectDuring<WhisperTranscribeResponse>(
+      audioDurationSeconds: nominalSeconds,
+      whisperThreads: threads,
+      work: () async {
+        _kickDrain();
+        await _drainLocks;
+        if (_disposed) {
+          throw StateError('Transcription disposed before finalize completed.');
+        }
+        return WhisperTranscribeResponse(
+          type: 'transcribe',
+          text: _mergedText,
+          segments: _mergedSegments.isEmpty
+              ? null
+              : List<WhisperTranscribeSegment>.from(_mergedSegments),
+        );
+      },
+    );
+
+    final cleaned = _svc._clampAndSanitizeResponse(
+      mergedResponse,
+      totalDurationMs: totalDurMs,
+    );
+    _svc._logWhisperSegments(cleaned, modelId: kBanglaWhisper.id);
+    final text = cleaned.text.trim();
+
+    log(
+      'live_finalize windows=$_chunksDone total_samples=$_samplesIngestedTotal (~${nominalSeconds.toStringAsFixed(2)} s)',
+      name: 'TranscriptionService',
+    );
+
+    _svc._logTranscript(
+      text,
+      audioSeconds: nominalSeconds.ceil(),
+      modelId: kBanglaWhisper.id,
+    );
+
+    _disposed = true;
+    backlogHudLine.value = '';
+    backlogAudioSeconds.value = 0;
+    return text;
+  }
+
+  void disposeAbandoned() {
+    _disposed = true;
+    backlogHudLine.value = '';
+    backlogAudioSeconds.value = 0;
+  }
+}
+
+class _ByteFifo {
+  Uint8List _buf = Uint8List(8192);
+  int _len = 0;
+
+  int get byteLength => _len;
+
+  void add(Uint8List u) {
+    final need = _len + u.length;
+    while (need > _buf.length) {
+      final next = Uint8List(_buf.length * 2);
+      next.setRange(0, _len, _buf);
+      _buf = next;
+    }
+    _buf.setRange(_len, need, u);
+    _len = need;
+  }
+
+  void dropFirst(int nbytes) {
+    if (nbytes <= 0) return;
+    if (nbytes >= _len) {
+      clear();
+      return;
+    }
+    final remain = _len - nbytes;
+    _buf.setRange(0, remain, _buf, nbytes);
+    _len = remain;
+  }
+
+  void clear() {
+    _len = 0;
+  }
+
+  Int16List int16Slice(int fifoByteOffset, int sampleCount) {
+    final nbytes = sampleCount * 2;
+    assert(fifoByteOffset >= 0 && fifoByteOffset + nbytes <= _len);
+    final u8 =
+        Uint8List.sublistView(_buf, fifoByteOffset, fifoByteOffset + nbytes);
+    return Int16List.view(u8.buffer, u8.offsetInBytes, sampleCount);
   }
 }
 

@@ -80,6 +80,33 @@ class TranscriptionResourceMonitorService extends GetxService {
   static const Duration _sampleInterval = Duration(milliseconds: 400);
   static const Duration _elapsedTick = Duration(milliseconds: 100);
 
+  Timer? _pipelinedObserveTimer;
+  Stopwatch? _pipelinedStopwatch;
+
+  /// Lightweight HUD used while PCM is streamed (recording) before [collectDuring] wraps backlog drain.
+  void beginPipelinedTranscribeObserve() {
+    _pipelinedObserveTimer?.cancel();
+    liveTranscribeActive.value = true;
+    liveElapsed.value = Duration.zero;
+    liveRssCurrentBytes.value = null;
+    liveRssPeakBytes.value = null;
+    liveCpuLastIntervalPct.value = null;
+    liveCpuPeakIntervalPct.value = null;
+    liveOsThreadCount.value = null;
+    liveOsThreadPeak.value = null;
+    _pipelinedStopwatch = Stopwatch()..start();
+    _pipelinedObserveTimer = Timer.periodic(_elapsedTick, (_) {
+      liveElapsed.value = _pipelinedStopwatch?.elapsed ?? Duration.zero;
+    });
+  }
+
+  void endPipelinedTranscribeObserve() {
+    _pipelinedObserveTimer?.cancel();
+    _pipelinedObserveTimer = null;
+    _pipelinedStopwatch = null;
+    liveTranscribeActive.value = false;
+  }
+
   /// Runs [work] while sampling process metrics on the main isolate.
   Future<R> collectDuring<R>({
     required Future<R> Function() work,

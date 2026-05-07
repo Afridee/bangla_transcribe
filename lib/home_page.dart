@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
 import 'package:get/get.dart';
@@ -17,15 +18,25 @@ class HomePage extends StatefulWidget {
   @override
   State<HomePage> createState() => _HomePageState();
 }
-
 class _HomePageState extends State<HomePage> {
   late final TranscriptionService _tx;
   late final RecordingService _rec;
   late final LastModelAudioSampleService _sample;
   late final TranscriptionResourceMonitorService _resources;
+
+  LiveTranscriptionSession? _pcmLive;
+  StreamSubscription<Uint8List>? _pcmSub;
+
   final _transcript = ''.obs;
   final _busy = false.obs;
   final _status = ''.obs;
+
+  @override
+  void dispose() {
+    unawaited(_pcmSub?.cancel());
+    _pcmLive?.disposeAbandoned();
+    super.dispose();
+  }
 
   @override
   void initState() {
@@ -58,31 +69,98 @@ class _HomePageState extends State<HomePage> {
     _status.value = '';
     try {
       await _ensureModel();
-      await _rec.start();
+      _transcript.value = '';
+      await _pcmSub?.cancel();
+      _pcmLive?.disposeAbandoned();
+      _pcmLive = null;
+      _pcmSub = null;
+
+      _pcmLive = _tx.beginLiveTranscription(
+        onPartial: (t) => _transcript.value = t,
+      );
+      await _rec.startStreaming();
+      _resources.beginPipelinedTranscribeObserve();
+      _pcmSub = _rec.pcm16Stream.listen(
+        (bytes) {
+          try {
+            _pcmLive!.ingestAlignedPcm16Mono(bytes);
+          } on TranscriptionInputTooLongException catch (e) {
+            _status.value = e.toString();
+            unawaited(_abortRecordingDueToHardLimit());
+          } catch (e) {
+            _status.value = e.toString();
+            unawaited(_abortRecordingDueToHardLimit());
+          }
+        },
+        cancelOnError: false,
+      );
     } on MicPermissionDeniedException catch (e) {
       _status.value = e.toString();
+      await _cleanUpFailedRecordingStart();
       if (e.permanentlyDenied) {
         await openAppSettings();
       }
     } catch (e) {
       _status.value = e.toString();
+      await _cleanUpFailedRecordingStart();
     } finally {
       _busy.value = false;
     }
   }
 
+  Future<void> _abortRecordingDueToHardLimit() async {
+    if (!_rec.isRecording.value) return;
+    await _pcmSub?.cancel();
+    _pcmSub = null;
+    _pcmLive?.disposeAbandoned();
+    _pcmLive = null;
+    _resources.endPipelinedTranscribeObserve();
+    await _rec.cancel();
+    _busy.value = false;
+  }
+
+  Future<void> _cleanUpFailedRecordingStart() async {
+    await _pcmSub?.cancel();
+    _pcmSub = null;
+    _pcmLive?.disposeAbandoned();
+    _pcmLive = null;
+    _resources.endPipelinedTranscribeObserve();
+    if (_rec.isRecording.value || _rec.isStreamingMode) {
+      await _rec.cancel();
+    }
+  }
+
   Future<void> _stopAndTranscribe() async {
     _busy.value = true;
-    _status.value = 'Transcribing…';
+    _status.value = 'Finishing…';
     String? wavPath;
     try {
-      wavPath = await _rec.stop();
+      await _pcmSub?.cancel();
+      _pcmSub = null;
+
+      wavPath = await _rec.stopStreaming();
+      _resources.endPipelinedTranscribeObserve();
+
+      final live = _pcmLive;
+      if (live == null) {
+        throw StateError('No live transcription session.');
+      }
+
       await _sample.captureFromPath(wavPath);
-      final text = await _tx.transcribeFile(wavPath);
+
+      _status.value = 'Transcribing…';
+      final text = await live.finalize(fullWavPath: wavPath);
       _transcript.value = text;
+      _pcmLive = null;
       _status.value = '';
+    } on TranscriptionInputTooLongException catch (e) {
+      _status.value = e.toString();
+      _pcmLive?.disposeAbandoned();
+      _pcmLive = null;
     } catch (e) {
       _status.value = e.toString();
+      _pcmLive?.disposeAbandoned();
+      _pcmLive = null;
     } finally {
       _busy.value = false;
       if (wavPath != null) {
@@ -146,7 +224,8 @@ class _HomePageState extends State<HomePage> {
               }),
               Expanded(
                 child: Obx(() {
-                  final live = _resources.liveTranscribeActive.value;
+                  final live = _resources.liveTranscribeActive.value ||
+                      _rec.isRecording.value;
                   if (!live) {
                     return Column(
                       crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -227,17 +306,32 @@ class _HomePageState extends State<HomePage> {
               }),
               Obx(() {
                 if (!_rec.isRecording.value) return const SizedBox(height: 8);
+                final line = _pcmLive?.backlogHudLine.value ?? '';
                 return Padding(
                   padding: const EdgeInsets.only(top: 12),
-                  child: Center(
-                    child: Text(
-                      _formatDuration(_rec.elapsed.value),
-                      style: const TextStyle(
-                        fontFeatures: [FontFeature.tabularFigures()],
-                        fontSize: 15,
-                        color: Colors.black54,
+                  child: Column(
+                    children: [
+                      Text(
+                        _formatDuration(_rec.elapsed.value),
+                        style: const TextStyle(
+                          fontFeatures: [FontFeature.tabularFigures()],
+                          fontSize: 15,
+                          color: Colors.black54,
+                        ),
                       ),
-                    ),
+                      if (line.isNotEmpty) ...[
+                        const SizedBox(height: 6),
+                        Text(
+                          line,
+                          textAlign: TextAlign.center,
+                          style: const TextStyle(
+                            fontSize: 12,
+                            height: 1.35,
+                            color: Colors.black54,
+                          ),
+                        ),
+                      ],
+                    ],
                   ),
                 );
               }),
@@ -257,7 +351,8 @@ class _HomePageState extends State<HomePage> {
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
           if (s.isNotEmpty &&
-              !_resources.liveTranscribeActive.value)
+              !_resources.liveTranscribeActive.value &&
+              !_rec.isRecording.value)
             Padding(
               padding: const EdgeInsets.only(bottom: 12),
               child: Text(
@@ -436,7 +531,8 @@ class _HomePageState extends State<HomePage> {
 
   Widget _liveTranscribePanel(BuildContext context) {
     return Obx(() {
-      if (!_resources.liveTranscribeActive.value) {
+      if (!_resources.liveTranscribeActive.value &&
+          !_rec.isRecording.value) {
         return const SizedBox.shrink();
       }
 
@@ -493,7 +589,9 @@ class _HomePageState extends State<HomePage> {
                     const SizedBox(width: 8),
                     Expanded(
                       child: Text(
-                        'Transcribing',
+                        _rec.isRecording.value
+                            ? 'Listening / transcribing'
+                            : 'Transcribing',
                         maxLines: 1,
                         overflow: TextOverflow.ellipsis,
                         style: TextStyle(
