@@ -25,6 +25,7 @@ class WhisperVariant {
     required this.url,
     required this.filename,
     required this.approxSizeMB,
+    required this.minSizeBytes,
     this.expectedSha256,
     this.lockedLanguage,
   });
@@ -34,20 +35,22 @@ class WhisperVariant {
   final String url;
   final String filename;
   final int approxSizeMB;
+  final int minSizeBytes;
   final String? expectedSha256;
   final String? lockedLanguage;
 }
 
-/// Fine-tuned Bangla Whisper-small Q8_0 GGML — near-lossless vs f16, ~43% smaller, often lower RSS on device.
+/// Fine-tuned Bangla Whisper-tiny (ehzawad/whisper-tiny-bn) Q8_0 GGML for on-device use.
 const WhisperVariant kBanglaWhisper = WhisperVariant(
-  id: 'whisper-small-bangla-q8_0',
-  label: 'Bangla (whisper-small-bangla, q8_0)',
+  id: 'whisper-tiny-bn-q8_0',
+  label: 'Bangla (whisper-tiny-bn, q8_0)',
   url:
-      'https://huggingface.co/afridee/banglaasr-ggml/resolve/main/ggml-whisper-small-bangla-q8_0.bin',
-  filename: 'ggml-whisper-small-bangla-q8_0.bin',
-  approxSizeMB: 264,
+      'https://huggingface.co/afridee/whisper-tiny-bn-ggml/resolve/main/ggml-whisper-tiny-bn-q8_0.bin',
+  filename: 'ggml-whisper-tiny-bn-q8_0.bin',
+  approxSizeMB: 42,
+  minSizeBytes: 35 * 1024 * 1024,
   expectedSha256:
-      'f248fc0a32d64e7da768ee88f0e5d2aa34f3152c95cc46922856bed03ac8b22b',
+      'b834f768f83ab726881a1f68a6d8592c928c8be7b7422a9cf351e991a36370aa',
   lockedLanguage: 'bn',
 );
 
@@ -72,7 +75,6 @@ class TranscriptionService extends GetxService {
   final downloadPct = 0.obs;
   final lastError = RxnString();
 
-  static const int _minSaneSize = 50 * 1024 * 1024;
   static const int _maxTranscribeDurationSeconds = 45 * 60;
 
   /// Long clips are split into overlapping windows (short passes decode more reliably for this model).
@@ -125,7 +127,7 @@ class TranscriptionService extends GetxService {
 
   Future<void> _refreshInstalled() async {
     final path = await _pathFor(kBanglaWhisper);
-    isInstalled.value = await _isUsable(File(path));
+    isInstalled.value = await _isUsable(File(path), kBanglaWhisper);
     downloadPct.value = isInstalled.value ? 100 : 0;
   }
 
@@ -138,7 +140,7 @@ class TranscriptionService extends GetxService {
       final targetPath = await _pathFor(variant);
       final target = File(targetPath);
 
-      if (await _isUsable(target)) {
+      if (await _isUsable(target, variant)) {
         if (variant.expectedSha256 != null) {
           final ok = await _verifySha256(target, variant.expectedSha256!);
           if (!ok) {
@@ -155,7 +157,12 @@ class TranscriptionService extends GetxService {
         }
       }
 
-      await _downloadStreaming(Uri.parse(variant.url), target, onProgress);
+      await _downloadStreaming(
+        Uri.parse(variant.url),
+        target,
+        variant,
+        onProgress,
+      );
 
       if (variant.expectedSha256 != null) {
         final ok = await _verifySha256(target, variant.expectedSha256!);
@@ -185,7 +192,7 @@ class TranscriptionService extends GetxService {
   Future<TranscriptionService> warmup() async {
     final variant = kBanglaWhisper;
     final path = await _pathFor(variant);
-    if (!await _isUsable(File(path))) {
+    if (!await _isUsable(File(path), variant)) {
       throw StateError(
         'TranscriptionService.warmup() called before ensureInstalled() '
         'for ${variant.id}.',
@@ -633,7 +640,7 @@ class TranscriptionService extends GetxService {
         return WhisperTranscribeResponse.fromJson(result);
       }
 
-      final whisper = Whisper(model: WhisperModel.small);
+      final whisper = Whisper(model: WhisperModel.tiny);
       final response = await whisper.transcribe(
         transcribeRequest: TranscribeRequest(
           audio: audioPath,
@@ -907,10 +914,10 @@ class TranscriptionService extends GetxService {
     return '${await _modelDir()}/${v.filename}';
   }
 
-  Future<bool> _isUsable(File f) async {
+  Future<bool> _isUsable(File f, WhisperVariant variant) async {
     if (!await f.exists()) return false;
     final len = await f.length();
-    return len >= _minSaneSize;
+    return len >= variant.minSizeBytes;
   }
 
   Future<bool> _verifySha256(File f, String expectedHex) async {
@@ -929,6 +936,7 @@ class TranscriptionService extends GetxService {
   Future<void> _downloadStreaming(
     Uri uri,
     File target,
+    WhisperVariant variant,
     void Function(double)? onProgress,
   ) async {
     final partFile = File('${target.path}.part');
@@ -976,7 +984,7 @@ class TranscriptionService extends GetxService {
           'Whisper model download truncated before EOF.',
         );
       }
-      if (!await _isUsable(partFile)) {
+      if (!await _isUsable(partFile, variant)) {
         throw const HttpException(
           'Whisper model download too small to be valid.',
         );

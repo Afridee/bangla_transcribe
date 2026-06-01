@@ -6,7 +6,7 @@
 # quantized GGML .bin files for whisper.cpp / whisper_ggml on-device.
 #
 # Default source: bangla-speech-processing/BanglaASR. Override with HF_REPO,
-# e.g. ashrafulparan/whisper-small-bangla.
+# e.g. ashrafulparan/whisper-small-bangla or ehzawad/whisper-tiny-bn.
 #
 # What it produces (artifact names depend on HF_REPO and QUANT):
 #   BanglaASR + default QUANT=q5_0:
@@ -26,6 +26,8 @@
 #   ./scripts/convert_banglaasr_to_ggml.sh /tmp/bn      # BanglaASR, custom workdir
 #   HF_REPO=ashrafulparan/whisper-small-bangla \
 #     ./scripts/convert_banglaasr_to_ggml.sh ./build/wsb
+#   QUANT=q8_0 HF_REPO=ehzawad/whisper-tiny-bn \
+#     ./scripts/convert_banglaasr_to_ggml.sh ./build/whisper-tiny-bn
 #
 # Requirements (host machine — NOT the device)
 #   * macOS or Linux with at least 6 GB free disk and 4 GB free RAM
